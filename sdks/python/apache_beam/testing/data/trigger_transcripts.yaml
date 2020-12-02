@@ -51,10 +51,20 @@ allowed_lateness: 20
 accumulation_mode: accumulating
 transcript:
   - input: [1, 2, 10, 11, 80, 81]
-  - watermark: 100
+  - watermark: 10
   - expect:
-      - {window: [0, 9], values: [1, 2], timestamp: 9}
-      - {window: [10, 19], values: [10, 11], timestamp: 19}
+      - {window: [0, 9], values: [1, 2], timestamp: 9, final: false}
+  - watermark: 20
+  - expect:
+      - {window: [10, 19], values: [10, 11], timestamp: 19, final: false}
+  - watermark: 30
+  - expect:
+      - {window: [0, 9], values: [1, 2], timestamp: 9, final: true}
+  - watermark: 40
+  - expect:
+      - {window: [10, 19], values: [10, 11], timestamp: 19, final: true}
+  - watermark: 90
+  - expect:
       - {window: [80, 89], values: [80, 81], timestamp: 89, late: false}
   - input: [7, 8] # no output
   - input: [17, 18] # no output
