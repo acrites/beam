@@ -353,6 +353,7 @@ tasks.register("javaioPreCommit") {
   dependsOn(":sdks:java:io:jms:build")
   dependsOn(":sdks:java:io:kafka:build")
   dependsOn(":sdks:java:io:kafka:upgrade:build")
+  dependsOn(":sdks:java:extensions:kafka-factories:build")
   dependsOn(":sdks:java:io:kudu:build")
   dependsOn(":sdks:java:io:mongodb:build")
   dependsOn(":sdks:java:io:mqtt:build")
@@ -823,8 +824,7 @@ tasks.register("python313PostCommit") {
   dependsOn(":sdks:python:test-suites:dataflow:py313:postCommitIT")
   dependsOn(":sdks:python:test-suites:direct:py313:postCommitIT")
   dependsOn(":sdks:python:test-suites:direct:py313:hdfsIntegrationTest")
-  dependsOn(":sdks:python:test-suites:portable:py313:postCommitPy312")
-  dependsOn(":sdks:python:test-suites:dataflow:py313:inferencePostCommitITPy312")
+  dependsOn(":sdks:python:test-suites:portable:py313:postCommitPy313")
 }
 
 tasks.register("portablePythonPreCommit") {
