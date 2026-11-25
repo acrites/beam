@@ -22,7 +22,7 @@ import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Pr
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -64,7 +64,6 @@ import org.apache.beam.sdk.transforms.Materializations;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
 import org.apache.beam.sdk.transforms.windowing.TimestampCombiner;
 import org.apache.beam.sdk.transforms.windowing.WindowMappingFn;
-import org.apache.beam.sdk.util.ByteStringOutputStream;
 import org.apache.beam.sdk.util.CombineFnUtil;
 import org.apache.beam.sdk.util.Weighted;
 import org.apache.beam.sdk.util.construction.BeamUrns;
@@ -241,7 +240,10 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
 
   private final PipelineOptions pipelineOptions;
   private final Set<String> runnerCapabilities;
-  private final Map<StateKey, Object> stateKeyObjectCache;
+  private Map<ImmutableSideInputCacheKey, Object> sideInputObjectCache;
+  private final MutableSideInputLookupKey sideInputLookupKey;
+  private Map<ImmutableBundleUserStateKey, Object> userStateObjectCache;
+  private final MutableBundleUserStateLookupKey userStateLookupKey;
   private final Map<TupleTag<?>, SideInputSpec> sideInputSpecMap;
   private final BeamFnStateClient beamFnStateClient;
   private final String ptransformId;
@@ -249,13 +251,14 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
   private final Supplier<List<BeamFnApi.ProcessBundleRequest.CacheToken>> cacheTokens;
   private final Supplier<Cache<?, ?>> bundleCache;
   private final Cache<?, ?> processWideCache;
-  private final Collection<ThrowingRunnable> stateFinalizers;
+  private List<ThrowingRunnable> stateFinalizers;
   private final Coder<K> keyCoder;
   private final Coder<BoundedWindow> windowCoder;
+  private final MemoizedEncodedSupplier.EncodingBuffer encodingBuffer;
 
   private @Nullable Supplier<BoundedWindow> currentWindowSupplier;
-  private @Nullable Supplier<ByteString> encodedCurrentKeySupplier;
-  private @Nullable Supplier<ByteString> encodedCurrentWindowSupplier;
+  private @Nullable MemoizedEncodedSupplier<K> encodedCurrentKeySupplier;
+  private @Nullable MemoizedEncodedSupplier<BoundedWindow> encodedCurrentWindowSupplier;
 
   public FnApiStateAccessor(
       PipelineOptions pipelineOptions,
@@ -271,7 +274,10 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       Coder<BoundedWindow> windowCoder) {
     this.pipelineOptions = pipelineOptions;
     this.runnerCapabilities = runnerCapabilities;
-    this.stateKeyObjectCache = Maps.newHashMap();
+    this.sideInputObjectCache = new HashMap<>();
+    this.sideInputLookupKey = new MutableSideInputLookupKey();
+    this.userStateObjectCache = new HashMap<>();
+    this.userStateLookupKey = new MutableBundleUserStateLookupKey();
     this.sideInputSpecMap = sideInputSpecMap;
     this.beamFnStateClient = beamFnStateClient;
     this.ptransformId = ptransformId;
@@ -282,57 +288,26 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     this.keyCoder = keyCoder;
     this.windowCoder = windowCoder;
     this.stateFinalizers = new ArrayList<>();
+    this.encodingBuffer = new MemoizedEncodedSupplier.EncodingBuffer();
   }
 
   public void setKeyAndWindowContext(MutatingStateContext<K, BoundedWindow> keyAndWindowContext) {
     this.currentWindowSupplier = keyAndWindowContext::getCurrentWindow;
     this.encodedCurrentKeySupplier =
-        memoizeFunction(
+        new MemoizedEncodedSupplier<>(
             keyAndWindowContext::getCurrentKey,
+            keyCoder,
             key -> {
               checkState(
                   keyCoder != null, "Accessing state in unkeyed context, no key coder available");
-
-              ByteStringOutputStream encodedKeyOut = new ByteStringOutputStream();
-              try {
-                ((Coder) keyCoder).encode(key, encodedKeyOut, Coder.Context.NESTED);
-              } catch (IOException e) {
-                throw new IllegalStateException(e);
-              }
-              return encodedKeyOut.toByteString();
+              return encodingBuffer.encode(out -> keyCoder.encode(key, out, Coder.Context.NESTED));
             });
 
     this.encodedCurrentWindowSupplier =
-        memoizeFunction(
+        new MemoizedEncodedSupplier<>(
             currentWindowSupplier,
-            window -> {
-              ByteStringOutputStream encodedWindowOut = new ByteStringOutputStream();
-              try {
-                windowCoder.encode(window, encodedWindowOut);
-              } catch (IOException e) {
-                throw new IllegalStateException(e);
-              }
-              return encodedWindowOut.toByteString();
-            });
-  }
-
-  private static <ArgT, ResultT> Supplier<ResultT> memoizeFunction(
-      Supplier<ArgT> arg, Function<ArgT, ResultT> f) {
-    return new Supplier<ResultT>() {
-      private ArgT memoizedArg;
-      private ResultT memoizedResult;
-      private boolean initialized;
-
-      @Override
-      public ResultT get() {
-        ArgT currentArg = arg.get();
-        if (currentArg != memoizedArg || !initialized) {
-          memoizedResult = f.apply(this.memoizedArg = currentArg);
-          initialized = true;
-        }
-        return memoizedResult;
-      }
-    };
+            windowCoder,
+            window -> encodingBuffer.encode(out -> windowCoder.encode(window, out)));
   }
 
   @Override
@@ -342,41 +317,119 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     SideInputSpec sideInputSpec = sideInputSpecMap.get(tag);
     checkArgument(sideInputSpec != null, "Attempting to access unknown side input %s.", view);
 
-    ByteStringOutputStream encodedWindowOut = new ByteStringOutputStream();
-    try {
-      sideInputSpec
-          .getWindowCoder()
-          .encode(sideInputSpec.getWindowMappingFn().getSideInputWindow(window), encodedWindowOut);
-    } catch (IOException e) {
-      throw new IllegalStateException(e);
+    String accessPattern = sideInputSpec.getAccessPattern();
+    if (Materializations.MULTIMAP_MATERIALIZATION_URN.equals(accessPattern)) {
+      checkState(
+          sideInputSpec.getCoder() instanceof KvCoder,
+          "Expected %s but received %s.",
+          KvCoder.class,
+          sideInputSpec.getCoder().getClass());
+    } else if (!Materializations.ITERABLE_MATERIALIZATION_URN.equals(accessPattern)) {
+      throw new IllegalStateException(
+          String.format(
+              "This SDK is only capable of dealing with %s materializations "
+                  + "but was asked to handle %s for PCollectionView with tag %s.",
+              ImmutableList.of(
+                  Materializations.ITERABLE_MATERIALIZATION_URN,
+                  Materializations.MULTIMAP_MATERIALIZATION_URN),
+              accessPattern,
+              tag));
     }
-    ByteString encodedWindow = encodedWindowOut.toByteString();
-    // IDEA: If this StateKey shows up on caching profiles, create a custom object that is cheap to
-    // weigh and compare similar to the other statekey types in this file.
-    StateKey.Builder cacheKeyBuilder = StateKey.newBuilder();
 
-    switch (sideInputSpec.getAccessPattern()) {
+    BoundedWindow sideInputWindow = sideInputSpec.getWindowMappingFn().getSideInputWindow(window);
+    Coder<BoundedWindow> sideInputWindowCoder = sideInputSpec.getWindowCoder();
+    Object windowLookupKey;
+    @Nullable ByteString preEncodedWindow;
+    if (sideInputWindowCoder.consistentWithEquals()) {
+      windowLookupKey = sideInputWindow;
+      preEncodedWindow = null;
+    } else {
+      preEncodedWindow =
+          encodingBuffer.encode(out -> sideInputWindowCoder.encode(sideInputWindow, out));
+      windowLookupKey = preEncodedWindow;
+    }
+
+    String sideInputId = tag.getId();
+    if (!sideInputObjectCache.isEmpty()) {
+      sideInputLookupKey.set(sideInputId, windowLookupKey);
+      @Nullable Object cached = sideInputObjectCache.get(sideInputLookupKey);
+      if (cached != null) {
+        return (T) cached;
+      }
+    }
+
+    ByteString encodedWindow =
+        preEncodedWindow != null
+            ? preEncodedWindow
+            : encodingBuffer.encode(out -> sideInputWindowCoder.encode(sideInputWindow, out));
+    StateKey stateKey = createSideInputStateKey(accessPattern, sideInputId, encodedWindow);
+    @Nullable Object value = createSideInputView(sideInputSpec, tag, stateKey);
+    if (value != null) {
+      sideInputObjectCache.put(new ImmutableSideInputCacheKey(sideInputId, windowLookupKey), value);
+    }
+    return (T) value;
+  }
+
+  private StateKey createSideInputStateKey(
+      String accessPattern, String sideInputId, ByteString encodedWindow) {
+    StateKey.Builder cacheKeyBuilder = StateKey.newBuilder();
+    switch (accessPattern) {
       case Materializations.ITERABLE_MATERIALIZATION_URN:
         cacheKeyBuilder
             .getIterableSideInputBuilder()
             .setTransformId(ptransformId)
-            .setSideInputId(tag.getId())
+            .setSideInputId(sideInputId)
             .setWindow(encodedWindow);
         break;
-
       case Materializations.MULTIMAP_MATERIALIZATION_URN:
-        checkState(
-            sideInputSpec.getCoder() instanceof KvCoder,
-            "Expected %s but received %s.",
-            KvCoder.class,
-            sideInputSpec.getCoder().getClass());
         cacheKeyBuilder
             .getMultimapKeysSideInputBuilder()
             .setTransformId(ptransformId)
-            .setSideInputId(tag.getId())
+            .setSideInputId(sideInputId)
             .setWindow(encodedWindow);
         break;
+      default:
+        throw new IllegalStateException(
+            String.format(
+                "This SDK is only capable of dealing with %s materializations "
+                    + "but was asked to handle %s for PCollectionView with id %s.",
+                ImmutableList.of(
+                    Materializations.ITERABLE_MATERIALIZATION_URN,
+                    Materializations.MULTIMAP_MATERIALIZATION_URN),
+                accessPattern,
+                sideInputId));
+    }
+    return cacheKeyBuilder.build();
+  }
 
+  private Object createSideInputView(
+      SideInputSpec sideInputSpec, TupleTag<?> tag, StateKey stateKey) {
+    switch (sideInputSpec.getAccessPattern()) {
+      case Materializations.ITERABLE_MATERIALIZATION_URN:
+        return sideInputSpec
+            .getViewFn()
+            .apply(
+                new IterableSideInput<>(
+                    getCacheForSideInput(stateKey),
+                    beamFnStateClient,
+                    processBundleInstructionId.get(),
+                    stateKey,
+                    sideInputSpec.getCoder()));
+      case Materializations.MULTIMAP_MATERIALIZATION_URN:
+        return sideInputSpec
+            .getViewFn()
+            .apply(
+                new MultimapSideInput<>(
+                    getCacheForSideInput(stateKey),
+                    beamFnStateClient,
+                    processBundleInstructionId.get(),
+                    stateKey,
+                    ((KvCoder) sideInputSpec.getCoder()).getKeyCoder(),
+                    ((KvCoder) sideInputSpec.getCoder()).getValueCoder(),
+                    runnerCapabilities.contains(
+                        BeamUrns.getUrn(
+                            RunnerApi.StandardRunnerProtocols.Enum
+                                .MULTIMAP_KEYS_VALUES_SIDE_INPUT))));
       default:
         throw new IllegalStateException(
             String.format(
@@ -388,48 +441,6 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
                 sideInputSpec.getAccessPattern(),
                 tag));
     }
-    return (T)
-        stateKeyObjectCache.computeIfAbsent(
-            cacheKeyBuilder.build(),
-            key -> {
-              switch (sideInputSpec.getAccessPattern()) {
-                case Materializations.ITERABLE_MATERIALIZATION_URN:
-                  return sideInputSpec
-                      .getViewFn()
-                      .apply(
-                          new IterableSideInput<>(
-                              getCacheFor(key),
-                              beamFnStateClient,
-                              processBundleInstructionId.get(),
-                              key,
-                              sideInputSpec.getCoder()));
-                case Materializations.MULTIMAP_MATERIALIZATION_URN:
-                  return sideInputSpec
-                      .getViewFn()
-                      .apply(
-                          new MultimapSideInput<>(
-                              getCacheFor(key),
-                              beamFnStateClient,
-                              processBundleInstructionId.get(),
-                              key,
-                              ((KvCoder) sideInputSpec.getCoder()).getKeyCoder(),
-                              ((KvCoder) sideInputSpec.getCoder()).getValueCoder(),
-                              runnerCapabilities.contains(
-                                  BeamUrns.getUrn(
-                                      RunnerApi.StandardRunnerProtocols.Enum
-                                          .MULTIMAP_KEYS_VALUES_SIDE_INPUT))));
-                default:
-                  throw new IllegalStateException(
-                      String.format(
-                          "This SDK is only capable of dealing with %s materializations "
-                              + "but was asked to handle %s for PCollectionView with tag %s.",
-                          ImmutableList.of(
-                              Materializations.ITERABLE_MATERIALIZATION_URN,
-                              Materializations.MULTIMAP_MATERIALIZATION_URN),
-                          sideInputSpec.getAccessPattern(),
-                          tag));
-              }
-            });
   }
 
   @Override
@@ -444,179 +455,179 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
 
   @Override
   public <T> ValueState<T> bindValue(String id, StateSpec<ValueState<T>> spec, Coder<T> coder) {
-    return (ValueState<T>)
-        stateKeyObjectCache.computeIfAbsent(
-            createBagUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                return new ValueState<T>() {
-                  private final BagUserState<T> impl = createBagUserState(key, coder);
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.BAG_USER_STATE, id);
+    if (cached != null) {
+      return (ValueState<T>) cached;
+    }
+    return cacheUserState(createValueState(createBagUserStateKey(id), coder));
+  }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
+  private <T> ValueState<T> createValueState(StateKey stateKey, Coder<T> coder) {
+    return new ValueState<T>() {
+      private final BagUserState<T> impl = createBagUserState(stateKey, coder);
 
-                  @Override
-                  public void write(T input) {
-                    impl.clear();
-                    impl.append(input);
-                  }
+      @Override
+      public void clear() {
+        impl.clear();
+      }
 
-                  @Override
-                  public T read() {
-                    Iterator<T> value = impl.get().iterator();
-                    if (value.hasNext()) {
-                      return value.next();
-                    } else {
-                      return null;
-                    }
-                  }
+      @Override
+      public void write(T input) {
+        impl.clear();
+        impl.append(input);
+      }
 
-                  @Override
-                  public ValueState<T> readLater() {
-                    impl.get().prefetch();
-                    return this;
-                  }
-                };
-              }
-            });
+      @Override
+      public T read() {
+        Iterator<T> value = impl.get().iterator();
+        if (value.hasNext()) {
+          return value.next();
+        } else {
+          return null;
+        }
+      }
+
+      @Override
+      public ValueState<T> readLater() {
+        impl.get().prefetch();
+        return this;
+      }
+    };
   }
 
   @Override
   public <T> BagState<T> bindBag(String id, StateSpec<BagState<T>> spec, Coder<T> elemCoder) {
-    return (BagState<T>)
-        stateKeyObjectCache.computeIfAbsent(
-            createBagUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                return new BagState<T>() {
-                  private final BagUserState<T> impl = createBagUserState(key, elemCoder);
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.BAG_USER_STATE, id);
+    if (cached != null) {
+      return (BagState<T>) cached;
+    }
+    return cacheUserState(createBagState(createBagUserStateKey(id), elemCoder));
+  }
 
-                  @Override
-                  public void add(T value) {
-                    impl.append(value);
-                  }
+  private <T> BagState<T> createBagState(StateKey stateKey, Coder<T> elemCoder) {
+    return new BagState<T>() {
+      private final BagUserState<T> impl = createBagUserState(stateKey, elemCoder);
 
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public @Nullable Boolean read() {
-                        return !impl.get().iterator().hasNext();
-                      }
+      @Override
+      public void add(T value) {
+        impl.append(value);
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public @Nullable Boolean read() {
+            return !impl.get().iterator().hasNext();
+          }
 
-                  @Override
-                  public Iterable<T> read() {
-                    return impl.get();
-                  }
+          @Override
+          public ReadableState<Boolean> readLater() {
+            return this;
+          }
+        };
+      }
 
-                  @Override
-                  public BagState<T> readLater() {
-                    impl.get().prefetch();
-                    return this;
-                  }
+      @Override
+      public Iterable<T> read() {
+        return impl.get();
+      }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
-                };
-              }
-            });
+      @Override
+      public BagState<T> readLater() {
+        impl.get().prefetch();
+        return this;
+      }
+
+      @Override
+      public void clear() {
+        impl.clear();
+      }
+    };
   }
 
   @Override
   public <T> SetState<T> bindSet(String id, StateSpec<SetState<T>> spec, Coder<T> elemCoder) {
-    return (SetState<T>)
-        stateKeyObjectCache.computeIfAbsent(
-            createMultimapKeysUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                return new SetState<T>() {
-                  private final MultimapUserState<T, Void> impl =
-                      createMultimapUserState(key, elemCoder, VoidCoder.of());
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.MULTIMAP_KEYS_USER_STATE, id);
+    if (cached != null) {
+      return (SetState<T>) cached;
+    }
+    return cacheUserState(createSetState(createMultimapKeysUserStateKey(id), elemCoder));
+  }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
+  private <T> SetState<T> createSetState(StateKey stateKey, Coder<T> elemCoder) {
+    return new SetState<T>() {
+      private final MultimapUserState<T, Void> impl =
+          createMultimapUserState(stateKey, elemCoder, VoidCoder.of());
 
-                  @Override
-                  public ReadableState<Boolean> contains(T t) {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public Boolean read() {
-                        return !Iterables.isEmpty(impl.get(t));
-                      }
+      @Override
+      public void clear() {
+        impl.clear();
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        impl.get(t).prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> contains(T t) {
+        return new ReadableState<Boolean>() {
+          @Override
+          public Boolean read() {
+            return !Iterables.isEmpty(impl.get(t));
+          }
 
-                  @Override
-                  public ReadableState<Boolean> addIfAbsent(T t) {
-                    boolean isEmpty = Iterables.isEmpty(impl.get(t));
-                    if (isEmpty) {
-                      impl.put(t, null);
-                    }
-                    return ReadableStates.immediate(isEmpty);
-                  }
+          @Override
+          public ReadableState<Boolean> readLater() {
+            impl.get(t).prefetch();
+            return this;
+          }
+        };
+      }
 
-                  @Override
-                  public void remove(T t) {
-                    impl.remove(t);
-                  }
+      @Override
+      public ReadableState<Boolean> addIfAbsent(T t) {
+        boolean isEmpty = Iterables.isEmpty(impl.get(t));
+        if (isEmpty) {
+          impl.put(t, null);
+        }
+        return ReadableStates.immediate(isEmpty);
+      }
 
-                  @Override
-                  public void add(T value) {
-                    impl.remove(value);
-                    impl.put(value, null);
-                  }
+      @Override
+      public void remove(T t) {
+        impl.remove(t);
+      }
 
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public Boolean read() {
-                        return Iterables.isEmpty(impl.keys());
-                      }
+      @Override
+      public void add(T value) {
+        impl.remove(value);
+        impl.put(value, null);
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        impl.keys().prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public Boolean read() {
+            return Iterables.isEmpty(impl.keys());
+          }
 
-                  @Override
-                  public Iterable<T> read() {
-                    return impl.keys();
-                  }
+          @Override
+          public ReadableState<Boolean> readLater() {
+            impl.keys().prefetch();
+            return this;
+          }
+        };
+      }
 
-                  @Override
-                  public SetState<T> readLater() {
-                    impl.keys().prefetch();
-                    return this;
-                  }
-                };
-              }
-            });
+      @Override
+      public Iterable<T> read() {
+        return impl.keys();
+      }
+
+      @Override
+      public SetState<T> readLater() {
+        impl.keys().prefetch();
+        return this;
+      }
+    };
   }
 
   @Override
@@ -625,135 +636,135 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       StateSpec<MapState<KeyT, ValueT>> spec,
       Coder<KeyT> mapKeyCoder,
       Coder<ValueT> mapValueCoder) {
-    return (MapState<KeyT, ValueT>)
-        stateKeyObjectCache.computeIfAbsent(
-            createMultimapKeysUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                return new MapState<KeyT, ValueT>() {
-                  private final MultimapUserState<KeyT, ValueT> impl =
-                      createMultimapUserState(key, mapKeyCoder, mapValueCoder);
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.MULTIMAP_KEYS_USER_STATE, id);
+    if (cached != null) {
+      return (MapState<KeyT, ValueT>) cached;
+    }
+    return cacheUserState(
+        createMapState(createMultimapKeysUserStateKey(id), mapKeyCoder, mapValueCoder));
+  }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
+  private <KeyT, ValueT> MapState<KeyT, ValueT> createMapState(
+      StateKey stateKey, Coder<KeyT> mapKeyCoder, Coder<ValueT> mapValueCoder) {
+    return new MapState<KeyT, ValueT>() {
+      private final MultimapUserState<KeyT, ValueT> impl =
+          createMultimapUserState(stateKey, mapKeyCoder, mapValueCoder);
 
-                  @Override
-                  public void put(KeyT key, ValueT value) {
-                    impl.remove(key);
-                    impl.put(key, value);
-                  }
+      @Override
+      public void clear() {
+        impl.clear();
+      }
 
-                  @Override
-                  public ReadableState<ValueT> computeIfAbsent(
-                      KeyT key, Function<? super KeyT, ? extends ValueT> mappingFunction) {
-                    Iterable<ValueT> values = impl.get(key);
-                    if (Iterables.isEmpty(values)) {
-                      impl.put(key, mappingFunction.apply(key));
-                    }
-                    return ReadableStates.immediate(Iterables.getOnlyElement(values, null));
-                  }
+      @Override
+      public void put(KeyT key, ValueT value) {
+        impl.remove(key);
+        impl.put(key, value);
+      }
 
-                  @Override
-                  public void remove(KeyT key) {
-                    impl.remove(key);
-                  }
+      @Override
+      public ReadableState<ValueT> computeIfAbsent(
+          KeyT key, Function<? super KeyT, ? extends ValueT> mappingFunction) {
+        Iterable<ValueT> values = impl.get(key);
+        if (Iterables.isEmpty(values)) {
+          impl.put(key, mappingFunction.apply(key));
+        }
+        return ReadableStates.immediate(Iterables.getOnlyElement(values, null));
+      }
 
-                  @Override
-                  public ReadableState<ValueT> get(KeyT key) {
-                    return getOrDefault(key, null);
-                  }
+      @Override
+      public void remove(KeyT key) {
+        impl.remove(key);
+      }
 
-                  @Override
-                  public ReadableState<ValueT> getOrDefault(
-                      KeyT key, @Nullable ValueT defaultValue) {
-                    return new ReadableState<ValueT>() {
-                      @Override
-                      public @Nullable ValueT read() {
-                        Iterable<ValueT> values = impl.get(key);
-                        return Iterables.getOnlyElement(values, defaultValue);
-                      }
+      @Override
+      public ReadableState<ValueT> get(KeyT key) {
+        return getOrDefault(key, null);
+      }
 
-                      @Override
-                      public ReadableState<ValueT> readLater() {
-                        impl.get(key).prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<ValueT> getOrDefault(KeyT key, @Nullable ValueT defaultValue) {
+        return new ReadableState<ValueT>() {
+          @Override
+          public @Nullable ValueT read() {
+            Iterable<ValueT> values = impl.get(key);
+            return Iterables.getOnlyElement(values, defaultValue);
+          }
 
-                  @Override
-                  public ReadableState<Iterable<KeyT>> keys() {
-                    return new ReadableState<Iterable<KeyT>>() {
-                      @Override
-                      public Iterable<KeyT> read() {
-                        return impl.keys();
-                      }
+          @Override
+          public ReadableState<ValueT> readLater() {
+            impl.get(key).prefetch();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Iterable<KeyT>> readLater() {
-                        impl.keys().prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<KeyT>> keys() {
+        return new ReadableState<Iterable<KeyT>>() {
+          @Override
+          public Iterable<KeyT> read() {
+            return impl.keys();
+          }
 
-                  @Override
-                  public ReadableState<Iterable<ValueT>> values() {
-                    return new ReadableState<Iterable<ValueT>>() {
-                      @Override
-                      public Iterable<ValueT> read() {
-                        return Iterables.transform(entries().read(), e -> e.getValue());
-                      }
+          @Override
+          public ReadableState<Iterable<KeyT>> readLater() {
+            impl.keys().prefetch();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Iterable<ValueT>> readLater() {
-                        entries().readLater();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<ValueT>> values() {
+        return new ReadableState<Iterable<ValueT>>() {
+          @Override
+          public Iterable<ValueT> read() {
+            return Iterables.transform(entries().read(), e -> e.getValue());
+          }
 
-                  @Override
-                  public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> entries() {
-                    return new ReadableState<Iterable<Map.Entry<KeyT, ValueT>>>() {
-                      @Override
-                      public Iterable<Map.Entry<KeyT, ValueT>> read() {
-                        Iterable<KeyT> keys = keys().read();
-                        return Iterables.transform(
-                            keys, key -> Maps.immutableEntry(key, get(key).read()));
-                      }
+          @Override
+          public ReadableState<Iterable<ValueT>> readLater() {
+            entries().readLater();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> readLater() {
-                        // Start prefetching the keys. We would need to block to start prefetching
-                        // the values.
-                        keys().readLater();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> entries() {
+        return new ReadableState<Iterable<Map.Entry<KeyT, ValueT>>>() {
+          @Override
+          public Iterable<Map.Entry<KeyT, ValueT>> read() {
+            Iterable<KeyT> keys = keys().read();
+            return Iterables.transform(keys, key -> Maps.immutableEntry(key, get(key).read()));
+          }
 
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public Boolean read() {
-                        return Iterables.isEmpty(keys().read());
-                      }
+          @Override
+          public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> readLater() {
+            // Start prefetching the keys. We would need to block to start prefetching
+            // the values.
+            keys().readLater();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        keys().readLater();
-                        return this;
-                      }
-                    };
-                  }
-                };
-              }
-            });
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public Boolean read() {
+            return Iterables.isEmpty(keys().read());
+          }
+
+          @Override
+          public ReadableState<Boolean> readLater() {
+            keys().readLater();
+            return this;
+          }
+        };
+      }
+    };
   }
 
   @Override
@@ -762,185 +773,266 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       StateSpec<MultimapState<KeyT, ValueT>> spec,
       Coder<KeyT> keyCoder,
       Coder<ValueT> valueCoder) {
-    return (MultimapState<KeyT, ValueT>)
-        stateKeyObjectCache.computeIfAbsent(
-            createMultimapKeysUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey stateKey) {
-                return new MultimapState<KeyT, ValueT>() {
-                  private final MultimapUserState<KeyT, ValueT> impl =
-                      createMultimapUserState(stateKey, keyCoder, valueCoder);
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.MULTIMAP_KEYS_USER_STATE, id);
+    if (cached != null) {
+      return (MultimapState<KeyT, ValueT>) cached;
+    }
+    return cacheUserState(
+        createMultimapState(createMultimapKeysUserStateKey(id), keyCoder, valueCoder));
+  }
 
-                  @Override
-                  public void put(KeyT key, ValueT value) {
-                    impl.put(key, value);
-                  }
+  private <KeyT, ValueT> MultimapState<KeyT, ValueT> createMultimapState(
+      StateKey stateKey, Coder<KeyT> keyCoder, Coder<ValueT> valueCoder) {
+    return new MultimapState<KeyT, ValueT>() {
+      private final MultimapUserState<KeyT, ValueT> impl =
+          createMultimapUserState(stateKey, keyCoder, valueCoder);
 
-                  @Override
-                  public ReadableState<Iterable<ValueT>> get(KeyT key) {
-                    return new ReadableState<Iterable<ValueT>>() {
-                      @Override
-                      public Iterable<ValueT> read() {
-                        return impl.get(key);
-                      }
+      @Override
+      public void put(KeyT key, ValueT value) {
+        impl.put(key, value);
+      }
 
-                      @Override
-                      public ReadableState<Iterable<ValueT>> readLater() {
-                        impl.get(key).prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<ValueT>> get(KeyT key) {
+        return new ReadableState<Iterable<ValueT>>() {
+          @Override
+          public Iterable<ValueT> read() {
+            return impl.get(key);
+          }
 
-                  @Override
-                  public void remove(KeyT key) {
-                    impl.remove(key);
-                  }
+          @Override
+          public ReadableState<Iterable<ValueT>> readLater() {
+            impl.get(key).prefetch();
+            return this;
+          }
+        };
+      }
 
-                  @Override
-                  public ReadableState<Iterable<KeyT>> keys() {
-                    return new ReadableState<Iterable<KeyT>>() {
-                      @Override
-                      public Iterable<KeyT> read() {
-                        return impl.keys();
-                      }
+      @Override
+      public void remove(KeyT key) {
+        impl.remove(key);
+      }
 
-                      @Override
-                      public ReadableState<Iterable<KeyT>> readLater() {
-                        impl.keys().prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<KeyT>> keys() {
+        return new ReadableState<Iterable<KeyT>>() {
+          @Override
+          public Iterable<KeyT> read() {
+            return impl.keys();
+          }
 
-                  @Override
-                  public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> entries() {
-                    return new ReadableState<Iterable<Map.Entry<KeyT, ValueT>>>() {
-                      @Override
-                      public Iterable<Map.Entry<KeyT, ValueT>> read() {
-                        return impl.entries();
-                      }
+          @Override
+          public ReadableState<Iterable<KeyT>> readLater() {
+            impl.keys().prefetch();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> readLater() {
-                        impl.entries().prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> entries() {
+        return new ReadableState<Iterable<Map.Entry<KeyT, ValueT>>>() {
+          @Override
+          public Iterable<Map.Entry<KeyT, ValueT>> read() {
+            return impl.entries();
+          }
 
-                  @Override
-                  public ReadableState<Boolean> containsKey(KeyT key) {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public Boolean read() {
-                        return !Iterables.isEmpty(impl.get(key));
-                      }
+          @Override
+          public ReadableState<Iterable<Map.Entry<KeyT, ValueT>>> readLater() {
+            impl.entries().prefetch();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        impl.get(key).prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> containsKey(KeyT key) {
+        return new ReadableState<Boolean>() {
+          @Override
+          public Boolean read() {
+            return !Iterables.isEmpty(impl.get(key));
+          }
 
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public Boolean read() {
-                        return Iterables.isEmpty(impl.keys());
-                      }
+          @Override
+          public ReadableState<Boolean> readLater() {
+            impl.get(key).prefetch();
+            return this;
+          }
+        };
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        impl.keys().prefetch();
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public Boolean read() {
+            return Iterables.isEmpty(impl.keys());
+          }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
-                };
-              }
-            });
+          @Override
+          public ReadableState<Boolean> readLater() {
+            impl.keys().prefetch();
+            return this;
+          }
+        };
+      }
+
+      @Override
+      public void clear() {
+        impl.clear();
+      }
+    };
   }
 
   @Override
   public <T> OrderedListState<T> bindOrderedList(
       String id, StateSpec<OrderedListState<T>> spec, Coder<T> elemCoder) {
-    return (OrderedListState<T>)
-        stateKeyObjectCache.computeIfAbsent(
-            createOrderedListUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                return new OrderedListState<T>() {
-                  private final OrderedListUserState<T> impl =
-                      createOrderedListUserState(key, elemCoder);
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.ORDERED_LIST_USER_STATE, id);
+    if (cached != null) {
+      return (OrderedListState<T>) cached;
+    }
+    return cacheUserState(createOrderedListState(createOrderedListUserStateKey(id), elemCoder));
+  }
 
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
+  private <T> OrderedListState<T> createOrderedListState(StateKey stateKey, Coder<T> elemCoder) {
+    return new OrderedListState<T>() {
+      private final OrderedListUserState<T> impl = createOrderedListUserState(stateKey, elemCoder);
 
-                  @Override
-                  public void add(TimestampedValue<T> value) {
-                    impl.add(value);
-                  }
+      @Override
+      public void clear() {
+        impl.clear();
+      }
 
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public @Nullable Boolean read() {
-                        return !impl.read().iterator().hasNext();
-                      }
+      @Override
+      public void add(TimestampedValue<T> value) {
+        impl.add(value);
+      }
 
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        return this;
-                      }
-                    };
-                  }
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public @Nullable Boolean read() {
+            return !impl.read().iterator().hasNext();
+          }
 
-                  @Nullable
-                  @Override
-                  public Iterable<TimestampedValue<T>> read() {
-                    return readRange(
-                        Instant.ofEpochMilli(Long.MIN_VALUE), Instant.ofEpochMilli(Long.MAX_VALUE));
-                  }
+          @Override
+          public ReadableState<Boolean> readLater() {
+            return this;
+          }
+        };
+      }
 
-                  @Override
-                  public GroupingState<TimestampedValue<T>, Iterable<TimestampedValue<T>>>
-                      readLater() {
-                    return this;
-                  }
+      @Nullable
+      @Override
+      public Iterable<TimestampedValue<T>> read() {
+        return readRange(
+            Instant.ofEpochMilli(Long.MIN_VALUE), Instant.ofEpochMilli(Long.MAX_VALUE));
+      }
 
-                  @Override
-                  public Iterable<TimestampedValue<T>> readRange(
-                      Instant minTimestamp, Instant limitTimestamp) {
-                    return impl.readRange(minTimestamp, limitTimestamp);
-                  }
+      @Override
+      public GroupingState<TimestampedValue<T>, Iterable<TimestampedValue<T>>> readLater() {
+        return this;
+      }
 
-                  @Override
-                  public void clearRange(Instant minTimestamp, Instant limitTimestamp) {
-                    impl.clearRange(minTimestamp, limitTimestamp);
-                  }
+      @Override
+      public Iterable<TimestampedValue<T>> readRange(Instant minTimestamp, Instant limitTimestamp) {
+        return impl.readRange(minTimestamp, limitTimestamp);
+      }
 
-                  @Override
-                  public OrderedListState<T> readRangeLater(
-                      Instant minTimestamp, Instant limitTimestamp) {
-                    return this;
-                  }
-                };
-              }
-            });
+      @Override
+      public void clearRange(Instant minTimestamp, Instant limitTimestamp) {
+        impl.clearRange(minTimestamp, limitTimestamp);
+      }
+
+      @Override
+      public OrderedListState<T> readRangeLater(Instant minTimestamp, Instant limitTimestamp) {
+        return this;
+      }
+    };
+  }
+
+  private <ElementT, AccumT, ResultT>
+      CombiningState<ElementT, AccumT, ResultT> createCombiningState(
+          StateKey stateKey,
+          Coder<AccumT> accumCoder,
+          CombineFn<ElementT, AccumT, ResultT> combineFn) {
+    // TODO: Support squashing accumulators depending on whether we know of all
+    // remote accumulators and local accumulators or just local accumulators.
+    return new CombiningState<ElementT, AccumT, ResultT>() {
+      private final BagUserState<AccumT> impl = createBagUserState(stateKey, accumCoder);
+
+      @Override
+      public AccumT getAccum() {
+        Iterator<AccumT> iterator = impl.get().iterator();
+        if (iterator.hasNext()) {
+          return iterator.next();
+        }
+        return combineFn.createAccumulator();
+      }
+
+      @Override
+      public void addAccum(AccumT accum) {
+        Iterator<AccumT> iterator = impl.get().iterator();
+
+        // Only merge if there was a prior value
+        if (iterator.hasNext()) {
+          accum = combineFn.mergeAccumulators(ImmutableList.of(iterator.next(), accum));
+          // Since there was a prior value, we need to clear.
+          impl.clear();
+        }
+
+        impl.append(accum);
+      }
+
+      @Override
+      public AccumT mergeAccumulators(Iterable<AccumT> accumulators) {
+        return combineFn.mergeAccumulators(accumulators);
+      }
+
+      @Override
+      public CombiningState<ElementT, AccumT, ResultT> readLater() {
+        impl.get().prefetch();
+        return this;
+      }
+
+      @Override
+      public ResultT read() {
+        Iterator<AccumT> iterator = impl.get().iterator();
+        if (iterator.hasNext()) {
+          return combineFn.extractOutput(iterator.next());
+        }
+        return combineFn.defaultValue();
+      }
+
+      @Override
+      public void add(ElementT value) {
+        AccumT newAccumulator = combineFn.addInput(getAccum(), value);
+        impl.clear();
+        impl.append(newAccumulator);
+      }
+
+      @Override
+      public ReadableState<Boolean> isEmpty() {
+        return new ReadableState<Boolean>() {
+          @Override
+          public @Nullable Boolean read() {
+            return !impl.get().iterator().hasNext();
+          }
+
+          @Override
+          public ReadableState<Boolean> readLater() {
+            impl.get().prefetch();
+            return this;
+          }
+        };
+      }
+
+      @Override
+      public void clear() {
+        impl.clear();
+      }
+    };
   }
 
   @Override
@@ -949,90 +1041,11 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       StateSpec<CombiningState<ElementT, AccumT, ResultT>> spec,
       Coder<AccumT> accumCoder,
       CombineFn<ElementT, AccumT, ResultT> combineFn) {
-    return (CombiningState<ElementT, AccumT, ResultT>)
-        stateKeyObjectCache.computeIfAbsent(
-            createBagUserStateKey(id),
-            new Function<StateKey, Object>() {
-              @Override
-              public Object apply(StateKey key) {
-                // TODO: Support squashing accumulators depending on whether we know of all
-                // remote accumulators and local accumulators or just local accumulators.
-                return new CombiningState<ElementT, AccumT, ResultT>() {
-                  private final BagUserState<AccumT> impl = createBagUserState(key, accumCoder);
-
-                  @Override
-                  public AccumT getAccum() {
-                    Iterator<AccumT> iterator = impl.get().iterator();
-                    if (iterator.hasNext()) {
-                      return iterator.next();
-                    }
-                    return combineFn.createAccumulator();
-                  }
-
-                  @Override
-                  public void addAccum(AccumT accum) {
-                    Iterator<AccumT> iterator = impl.get().iterator();
-
-                    // Only merge if there was a prior value
-                    if (iterator.hasNext()) {
-                      accum = combineFn.mergeAccumulators(ImmutableList.of(iterator.next(), accum));
-                      // Since there was a prior value, we need to clear.
-                      impl.clear();
-                    }
-
-                    impl.append(accum);
-                  }
-
-                  @Override
-                  public AccumT mergeAccumulators(Iterable<AccumT> accumulators) {
-                    return combineFn.mergeAccumulators(accumulators);
-                  }
-
-                  @Override
-                  public CombiningState<ElementT, AccumT, ResultT> readLater() {
-                    impl.get().prefetch();
-                    return this;
-                  }
-
-                  @Override
-                  public ResultT read() {
-                    Iterator<AccumT> iterator = impl.get().iterator();
-                    if (iterator.hasNext()) {
-                      return combineFn.extractOutput(iterator.next());
-                    }
-                    return combineFn.defaultValue();
-                  }
-
-                  @Override
-                  public void add(ElementT value) {
-                    AccumT newAccumulator = combineFn.addInput(getAccum(), value);
-                    impl.clear();
-                    impl.append(newAccumulator);
-                  }
-
-                  @Override
-                  public ReadableState<Boolean> isEmpty() {
-                    return new ReadableState<Boolean>() {
-                      @Override
-                      public @Nullable Boolean read() {
-                        return !impl.get().iterator().hasNext();
-                      }
-
-                      @Override
-                      public ReadableState<Boolean> readLater() {
-                        impl.get().prefetch();
-                        return this;
-                      }
-                    };
-                  }
-
-                  @Override
-                  public void clear() {
-                    impl.clear();
-                  }
-                };
-              }
-            });
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.BAG_USER_STATE, id);
+    if (cached != null) {
+      return (CombiningState<ElementT, AccumT, ResultT>) cached;
+    }
+    return cacheUserState(createCombiningState(createBagUserStateKey(id), accumCoder, combineFn));
   }
 
   @Override
@@ -1042,32 +1055,31 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
           StateSpec<CombiningState<ElementT, AccumT, ResultT>> spec,
           Coder<AccumT> accumCoder,
           CombineFnWithContext<ElementT, AccumT, ResultT> combineFn) {
-    return (CombiningState<ElementT, AccumT, ResultT>)
-        stateKeyObjectCache.computeIfAbsent(
-            createBagUserStateKey(id),
-            key ->
-                bindCombining(
-                    id,
-                    spec,
-                    accumCoder,
-                    CombineFnUtil.bindContext(
-                        combineFn,
-                        new StateContext<BoundedWindow>() {
-                          @Override
-                          public PipelineOptions getPipelineOptions() {
-                            return pipelineOptions;
-                          }
+    @Nullable Object cached = getCachedUserState(StateKey.TypeCase.BAG_USER_STATE, id);
+    if (cached != null) {
+      return (CombiningState<ElementT, AccumT, ResultT>) cached;
+    }
+    StateKey stateKey = createBagUserStateKey(id);
+    CombineFn<ElementT, AccumT, ResultT> boundCombineFn =
+        CombineFnUtil.bindContext(
+            combineFn,
+            new StateContext<BoundedWindow>() {
+              @Override
+              public PipelineOptions getPipelineOptions() {
+                return pipelineOptions;
+              }
 
-                          @Override
-                          public <T> T sideInput(PCollectionView<T> view) {
-                            return get(view, currentWindowSupplier.get());
-                          }
+              @Override
+              public <T> T sideInput(PCollectionView<T> view) {
+                return get(view, currentWindowSupplier.get());
+              }
 
-                          @Override
-                          public BoundedWindow window() {
-                            return currentWindowSupplier.get();
-                          }
-                        })));
+              @Override
+              public BoundedWindow window() {
+                return currentWindowSupplier.get();
+              }
+            });
+    return cacheUserState(createCombiningState(stateKey, accumCoder, boundCombineFn));
   }
 
   /**
@@ -1087,7 +1099,7 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
 
     public UserStateCacheTokenKey(ByteString bytes) {
       this.bytes = bytes;
-      this.hash = Objects.hash(UserStateCacheTokenKey.class, bytes);
+      this.hash = 31 * UserStateCacheTokenKey.class.hashCode() + bytes.hashCode();
     }
 
     @Override
@@ -1113,41 +1125,35 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     }
   }
 
-  private Cache<?, ?> getCacheFor(StateKey stateKey) {
+  private Cache<?, ?> getCacheForUserState(StateKey stateKey) {
+    Weighted cacheKey;
     switch (stateKey.getTypeCase()) {
       case BAG_USER_STATE:
-        for (CacheToken token : cacheTokens.get()) {
-          if (!token.hasUserState()) {
-            continue;
-          }
-          return Caches.subCache(
-              processWideCache,
-              new UserStateCacheTokenKey(token.getToken()),
-              new BagUserStateCacheKey(stateKey.getBagUserState()));
-        }
+        cacheKey = new BagUserStateCacheKey(stateKey.getBagUserState());
         break;
       case MULTIMAP_KEYS_USER_STATE:
-        for (CacheToken token : cacheTokens.get()) {
-          if (!token.hasUserState()) {
-            continue;
-          }
-          return Caches.subCache(
-              processWideCache,
-              new UserStateCacheTokenKey(token.getToken()),
-              new MultimapKeysUserStateCacheKey(stateKey.getMultimapKeysUserState()));
-        }
+        cacheKey = new MultimapKeysUserStateCacheKey(stateKey.getMultimapKeysUserState());
         break;
       case ORDERED_LIST_USER_STATE:
-        for (CacheToken token : cacheTokens.get()) {
-          if (!token.hasUserState()) {
-            continue;
-          }
-          return Caches.subCache(
-              processWideCache,
-              new UserStateCacheTokenKey(token.getToken()),
-              new OrderedListUserStateCacheKey(stateKey.getOrderedListUserState()));
-        }
+        cacheKey = new OrderedListUserStateCacheKey(stateKey.getOrderedListUserState());
         break;
+      default:
+        throw new IllegalStateException(
+            String.format("Unknown state key type requested %s.", stateKey));
+    }
+    for (CacheToken token : cacheTokens.get()) {
+      if (!token.hasUserState()) {
+        continue;
+      }
+      return Caches.subCache(
+          processWideCache, new UserStateCacheTokenKey(token.getToken()), cacheKey);
+    }
+    // The default is to use the bundle cache.
+    return Caches.subCache(bundleCache.get(), cacheKey);
+  }
+
+  private Cache<?, ?> getCacheForSideInput(StateKey stateKey) {
+    switch (stateKey.getTypeCase()) {
       case ITERABLE_SIDE_INPUT:
         for (CacheToken token : cacheTokens.get()) {
           if (!token.hasSideInput()) {
@@ -1194,10 +1200,32 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     return Caches.subCache(bundleCache.get(), stateKey);
   }
 
+  private @Nullable Object getCachedUserState(StateKey.TypeCase stateType, String stateId) {
+    ByteString encodedWindow = encodedCurrentWindowSupplier.get();
+    ByteString encodedKey = encodedCurrentKeySupplier.get();
+    userStateLookupKey.set(stateType, stateId, encodedWindow, encodedKey);
+    return userStateObjectCache.isEmpty() ? null : userStateObjectCache.get(userStateLookupKey);
+  }
+
+  private <StateT> StateT cacheUserState(StateT state) {
+    userStateObjectCache.put(new ImmutableBundleUserStateKey(userStateLookupKey), state);
+    return state;
+  }
+
+  private static <KeyT, ValT> Map<KeyT, ValT> clearOrResetMap(Map<KeyT, ValT> map) {
+    if (map.size() > MemoizedEncodedSupplier.MAX_RETAINED_CACHE_ENTRIES) {
+      return new HashMap<>();
+    }
+    if (!map.isEmpty()) {
+      map.clear();
+    }
+    return map;
+  }
+
   private <T> BagUserState<T> createBagUserState(StateKey stateKey, Coder<T> valueCoder) {
     BagUserState<T> rval =
         new BagUserState<>(
-            getCacheFor(stateKey),
+            getCacheForUserState(stateKey),
             beamFnStateClient,
             processBundleInstructionId.get(),
             stateKey,
@@ -1206,8 +1234,131 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     return rval;
   }
 
-  // Shared base for implementation of cache keys with the same
-  // fields that also uses the subclass for hashing and equality.
+  // Bundle-local side input cache key hierarchy; Map<ImmutableSideInputCacheKey, Object> forbids
+  // accidentally inserting MutableSideInputLookupKey at compile time while preserving symmetric
+  // equals/hashCode for HashMap.get(lookupKey).
+  private abstract static class SideInputCacheKey {
+    @Nullable String sideInputId;
+    @Nullable Object windowKey;
+    int hash;
+
+    static int computeHash(String sideInputId, @Nullable Object windowKey) {
+      return 31 * sideInputId.hashCode() + Objects.hashCode(windowKey);
+    }
+
+    @Override
+    public final int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public final boolean equals(@Nullable Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof SideInputCacheKey)) {
+        return false;
+      }
+      SideInputCacheKey other = (SideInputCacheKey) o;
+      return hash == other.hash
+          && Objects.equals(sideInputId, other.sideInputId)
+          && Objects.equals(windowKey, other.windowKey);
+    }
+  }
+
+  private static final class ImmutableSideInputCacheKey extends SideInputCacheKey {
+    ImmutableSideInputCacheKey(String sideInputId, @Nullable Object windowKey) {
+      this.sideInputId = sideInputId;
+      this.windowKey = windowKey;
+      this.hash = computeHash(sideInputId, windowKey);
+    }
+  }
+
+  private static final class MutableSideInputLookupKey extends SideInputCacheKey {
+    void set(String sideInputId, @Nullable Object windowKey) {
+      this.sideInputId = sideInputId;
+      this.windowKey = windowKey;
+      this.hash = computeHash(sideInputId, windowKey);
+    }
+
+    void reset() {
+      this.sideInputId = null;
+      this.windowKey = null;
+      this.hash = 0;
+    }
+  }
+
+  // Bundle-local user state key hierarchy; decoupled from processWideCache keys so ptransformId
+  // is not hashed/compared per element and Map<ImmutableBundleUserStateKey, Object> rejects mutable
+  // lookup keys at compile time.
+  private abstract static class BundleUserStateKey {
+    StateKey.@Nullable TypeCase stateType;
+    @Nullable String stateId;
+    @Nullable ByteString window;
+    @Nullable ByteString key;
+    int hash;
+
+    static int computeHash(
+        StateKey.TypeCase stateType, String stateId, ByteString window, ByteString key) {
+      int result = stateType.hashCode();
+      result = 31 * result + stateId.hashCode();
+      result = 31 * result + window.hashCode();
+      result = 31 * result + key.hashCode();
+      return result;
+    }
+
+    @Override
+    public final int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public final boolean equals(@Nullable Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (!(o instanceof BundleUserStateKey)) {
+        return false;
+      }
+      BundleUserStateKey other = (BundleUserStateKey) o;
+      return hash == other.hash
+          && stateType == other.stateType
+          && Objects.equals(stateId, other.stateId)
+          && Objects.equals(window, other.window)
+          && Objects.equals(key, other.key);
+    }
+  }
+
+  private static final class ImmutableBundleUserStateKey extends BundleUserStateKey {
+    ImmutableBundleUserStateKey(MutableBundleUserStateLookupKey lookupKey) {
+      this.stateType = lookupKey.stateType;
+      this.stateId = lookupKey.stateId;
+      this.window = lookupKey.window;
+      this.key = lookupKey.key;
+      this.hash = lookupKey.hash;
+    }
+  }
+
+  private static final class MutableBundleUserStateLookupKey extends BundleUserStateKey {
+    void set(StateKey.TypeCase stateType, String stateId, ByteString window, ByteString key) {
+      this.stateType = stateType;
+      this.stateId = stateId;
+      this.window = window;
+      this.key = key;
+      this.hash = computeHash(stateType, stateId, window, key);
+    }
+
+    void reset() {
+      this.stateType = null;
+      this.stateId = null;
+      this.window = null;
+      this.key = null;
+      this.hash = 0;
+    }
+  }
+
+  // Shared base for process-wide and bundle-level Cache keys with final fields for safe publication
+  // across threads and deterministic subclass discrimination.
   private abstract static class UserStateCacheKeyBase implements Weighted {
     private final String ptransformId;
     private final String stateId;
@@ -1216,12 +1367,17 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     private final int hash;
 
     protected UserStateCacheKeyBase(
-        Class subclass, String ptransformId, String stateId, ByteString window, ByteString key) {
+        Class<?> subclass, String ptransformId, String stateId, ByteString window, ByteString key) {
       this.ptransformId = ptransformId;
       this.stateId = stateId;
       this.window = window;
       this.key = key;
-      this.hash = Objects.hash(subclass, ptransformId, stateId, window, key);
+      int result = subclass.hashCode();
+      result = 31 * result + ptransformId.hashCode();
+      result = 31 * result + stateId.hashCode();
+      result = 31 * result + window.hashCode();
+      result = 31 * result + key.hashCode();
+      this.hash = result;
     }
 
     @Override
@@ -1267,8 +1423,8 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     StateKey.Builder builder = StateKey.newBuilder();
     builder
         .getBagUserStateBuilder()
-        .setWindow(encodedCurrentWindowSupplier.get())
-        .setKey(encodedCurrentKeySupplier.get())
+        .setWindow(userStateLookupKey.window)
+        .setKey(userStateLookupKey.key)
         .setTransformId(ptransformId)
         .setUserStateId(stateId);
     return builder.build();
@@ -1278,7 +1434,7 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       StateKey stateKey, Coder<KeyT> keyCoder, Coder<ValueT> valueCoder) {
     MultimapUserState<KeyT, ValueT> rval =
         new MultimapUserState(
-            getCacheFor(stateKey),
+            getCacheForUserState(stateKey),
             beamFnStateClient,
             processBundleInstructionId.get(),
             stateKey,
@@ -1303,8 +1459,8 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     StateKey.Builder builder = StateKey.newBuilder();
     builder
         .getMultimapKeysUserStateBuilder()
-        .setWindow(encodedCurrentWindowSupplier.get())
-        .setKey(encodedCurrentKeySupplier.get())
+        .setWindow(userStateLookupKey.window)
+        .setKey(userStateLookupKey.key)
         .setTransformId(ptransformId)
         .setUserStateId(stateId);
     return builder.build();
@@ -1314,7 +1470,7 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       StateKey stateKey, Coder<T> valueCoder) {
     OrderedListUserState<T> rval =
         new OrderedListUserState<>(
-            getCacheFor(stateKey),
+            getCacheForUserState(stateKey),
             beamFnStateClient,
             processBundleInstructionId.get(),
             stateKey,
@@ -1338,8 +1494,8 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
     StateKey.Builder builder = StateKey.newBuilder();
     builder
         .getOrderedListUserStateBuilder()
-        .setWindow(encodedCurrentWindowSupplier.get())
-        .setKey(encodedCurrentKeySupplier.get())
+        .setWindow(userStateLookupKey.window)
+        .setKey(userStateLookupKey.key)
         .setTransformId(ptransformId)
         .setUserStateId(stateId);
     return builder.build();
@@ -1356,8 +1512,22 @@ public class FnApiStateAccessor<K> implements SideInputReader, StateBinder {
       throw new IllegalStateException(e);
     } catch (Exception e) {
       throw new IllegalStateException(e);
+    } finally {
+      if (stateFinalizers.size() > MemoizedEncodedSupplier.MAX_RETAINED_CACHE_ENTRIES) {
+        stateFinalizers = new ArrayList<>();
+      } else {
+        stateFinalizers.clear();
+      }
+      sideInputObjectCache = clearOrResetMap(sideInputObjectCache);
+      userStateObjectCache = clearOrResetMap(userStateObjectCache);
+      sideInputLookupKey.reset();
+      userStateLookupKey.reset();
+      if (encodedCurrentKeySupplier != null) {
+        encodedCurrentKeySupplier.reset();
+      }
+      if (encodedCurrentWindowSupplier != null) {
+        encodedCurrentWindowSupplier.reset();
+      }
     }
-    stateFinalizers.clear();
-    stateKeyObjectCache.clear();
   }
 }

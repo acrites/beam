@@ -21,7 +21,6 @@ import static org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.base.Pr
 
 import com.google.auto.value.AutoValue;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
-import java.io.IOException;
 import java.util.Comparator;
 import java.util.NavigableSet;
 import java.util.function.Function;
@@ -31,7 +30,6 @@ import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.fn.data.FnDataReceiver;
 import org.apache.beam.sdk.state.TimeDomain;
 import org.apache.beam.sdk.transforms.windowing.BoundedWindow;
-import org.apache.beam.sdk.util.ByteStringOutputStream;
 import org.apache.beam.sdk.util.UserCodeException;
 import org.apache.beam.sdk.util.construction.Timer;
 import org.apache.beam.vendor.grpc.v1p69p0.com.google.protobuf.ByteString;
@@ -48,9 +46,10 @@ import org.apache.beam.vendor.guava.v32_1_2_jre.com.google.common.collect.Table.
             + " Making the class final or moving the throwing code"
             + " into a static factory method may fix it.")
 public class FnApiTimerBundleTracker<K> {
-  private final Supplier<ByteString> encodedCurrentKeySupplier;
-  private final Supplier<ByteString> encodedCurrentWindowSupplier;
-  private final Table<ByteString, ByteString, Modifications<K>> timerModifications;
+  private final MemoizedEncodedSupplier<K> encodedCurrentKeySupplier;
+  private final MemoizedEncodedSupplier<BoundedWindow> encodedCurrentWindowSupplier;
+  private final MemoizedEncodedSupplier.EncodingBuffer encodingBuffer;
+  private Table<ByteString, ByteString, Modifications<K>> timerModifications;
 
   @AutoValue
   public abstract static class TimerInfo<K> {
@@ -131,38 +130,32 @@ public class FnApiTimerBundleTracker<K> {
       Coder<BoundedWindow> windowCoder,
       Supplier<K> currentKeySupplier,
       Supplier<BoundedWindow> currentWindowSupplier) {
-    timerModifications = HashBasedTable.create();
+    this.timerModifications = HashBasedTable.create();
+    this.encodingBuffer = new MemoizedEncodedSupplier.EncodingBuffer();
     this.encodedCurrentKeySupplier =
-        memoizeFunction(
+        new MemoizedEncodedSupplier<>(
             currentKeySupplier,
+            keyCoder,
             key -> {
               checkState(
                   keyCoder != null, "Accessing state in unkeyed context, no key coder available");
-
-              ByteStringOutputStream encodedKeyOut = new ByteStringOutputStream();
-              try {
-                keyCoder.encode(key, encodedKeyOut, Coder.Context.NESTED);
-              } catch (IOException e) {
-                throw new IllegalStateException(e);
-              }
-              return encodedKeyOut.toByteString();
+              return encodingBuffer.encode(out -> keyCoder.encode(key, out, Coder.Context.NESTED));
             });
     this.encodedCurrentWindowSupplier =
-        memoizeFunction(
+        new MemoizedEncodedSupplier<>(
             currentWindowSupplier,
-            window -> {
-              ByteStringOutputStream encodedWindowOut = new ByteStringOutputStream();
-              try {
-                windowCoder.encode(window, encodedWindowOut);
-              } catch (IOException e) {
-                throw new IllegalStateException(e);
-              }
-              return encodedWindowOut.toByteString();
-            });
+            windowCoder,
+            window -> encodingBuffer.encode(out -> windowCoder.encode(window, out)));
   }
 
   public void reset() {
-    timerModifications.clear();
+    if (timerModifications.size() > MemoizedEncodedSupplier.MAX_RETAINED_CACHE_ENTRIES) {
+      timerModifications = HashBasedTable.create();
+    } else if (!timerModifications.isEmpty()) {
+      timerModifications.clear();
+    }
+    encodedCurrentKeySupplier.reset();
+    encodedCurrentWindowSupplier.reset();
   }
 
   public void timerModified(String timerFamilyOrId, TimeDomain timeDomain, Timer<K> timer) {
@@ -213,27 +206,5 @@ public class FnApiTimerBundleTracker<K> {
         }
       }
     }
-  }
-
-  private static <ArgT, ResultT> Supplier<ResultT> memoizeFunction(
-      Supplier<ArgT> arg, Function<ArgT, ResultT> f) {
-    return new Supplier<ResultT>() {
-      private @Nullable ArgT memoizedArg = null;
-      private @Nullable ResultT memoizedResult = null;
-
-      @Override
-      public ResultT get() {
-        ArgT currentArg = arg.get();
-        if (memoizedArg == null || currentArg != memoizedArg) {
-          this.memoizedArg = currentArg;
-          memoizedResult = f.apply(currentArg);
-        }
-        if (memoizedResult != null) {
-          return memoizedResult;
-        } else {
-          throw new RuntimeException("Unexpected null result.");
-        }
-      }
-    };
   }
 }
